@@ -1,63 +1,75 @@
 import React, { useState, useEffect, useRef } from "react";
 import { io } from "socket.io-client";
 import { Device } from "mediasoup-client";
-import { v4 as uuidv4 } from "uuid"; // For generating a unique peerId
+import { v4 as uuidv4 } from "uuid";
 
-const SERVER_URL = "http://localhost:3000"; // Update with your server URL if different
+const SERVER_URL = "http://localhost:3000";
 
 const VideoChat = () => {
+  // Basic connection and room state.
   const [socket, setSocket] = useState(null);
   const [roomId, setRoomId] = useState("");
   const [joined, setJoined] = useState(false);
-  const videoRef = useRef(null);
+  // For displaying remote video streams.
+  const [remoteStreams, setRemoteStreams] = useState([]);
+  // Queue peers if consumer transport is not ready.
+  const [pendingPeers, setPendingPeers] = useState([]);
 
-  // Hold mediasoup-related variables as refs to persist across renders
+  // Reference to the local video element.
+  const localVideoRef = useRef(null);
+
+  // Refs to hold mediasoup objects across renders.
   const deviceRef = useRef(null);
   const producerTransportRef = useRef(null);
+  const consumerTransportRef = useRef(null);
   const peerIdRef = useRef(uuidv4());
 
+  // Establish Socket.IO connection.
   useEffect(() => {
     const newSocket = io(SERVER_URL);
     setSocket(newSocket);
-
-    // Clean up socket on unmount
     return () => newSocket.close();
   }, []);
 
-  // Function to create a room on the server
+  // Create a room when the user clicks the button.
   const createRoom = () => {
     if (!socket || !roomId) return;
     socket.emit("create-room", roomId);
   };
 
-  // Listen for the room creation confirmation
+  // Socket event listeners.
   useEffect(() => {
     if (!socket) return;
 
+    // When the room is created, join it.
     socket.on("room-created", (data) => {
       console.log("Room created:", data.roomId);
-      // Once the room is created, emit join-room to get transport parameters
       socket.emit("join-room", {
         roomId: data.roomId,
         peerId: peerIdRef.current,
       });
     });
 
+    // When the join-room process completes, the server sends transport parameters.
     socket.on("room-joined", async (transportData) => {
-      console.log("Joined room, transport options received:", transportData);
-      await joinRoomTransport(transportData);
+      console.log("Joined room; received transport options:", transportData);
+      await setupTransports(transportData);
       setJoined(true);
     });
 
+    // When a new peer appears, try to consume its video.
     socket.on("new-peer", (newPeerId) => {
-      console.log("A new peer has joined:", newPeerId);
-      // You might want to update UI or perform additional actions here.
+      console.log("New peer joined:", newPeerId);
+      if (!consumerTransportRef.current) {
+        console.log("Consumer transport not ready, queuing peer", newPeerId);
+        setPendingPeers((prev) => [...prev, newPeerId]);
+      } else {
+        consumePeer(newPeerId);
+      }
     });
 
-    // Optional: handle errors (if your backend emits error events)
     socket.on("error", (err) => console.error("Socket error:", err));
 
-    // Clean up listeners on unmount or socket change
     return () => {
       socket.off("room-created");
       socket.off("room-joined");
@@ -66,46 +78,75 @@ const VideoChat = () => {
     };
   }, [socket]);
 
-  // This function sets up local media, initializes the mediasoup Device,
-  // and creates a producer transport using the transport parameters received from the backend.
-  const joinRoomTransport = async (transportData) => {
+  // Set up consumer and producer transports.
+  const setupTransports = async (transportData) => {
     try {
-      // Get local media stream
+      // 1. Get local media stream.
       const stream = await navigator.mediaDevices.getUserMedia({
         video: true,
         audio: true,
       });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
       }
 
-      // Initialize mediasoup Device
+      // 2. Initialize the mediasoup Device with the router RTP capabilities.
       deviceRef.current = new Device();
-      // NOTE: In a more complete implementation, you would pass router RTP capabilities here.
-      // For this demo, we assume the device is already compatible or capabilities are provided via transportData.
-      // await deviceRef.current.load({ routerRtpCapabilities: transportData.routerRtpCapabilities });
-
-      // Create send transport on the client using ICE parameters received from the server.
-      // The backend sent iceParameters and iceCandidates.
-      // Depending on your mediasoup-client version, you may need to include additional parameters.
-      producerTransportRef.current = deviceRef.current.createSendTransport({
-        iceParameters: transportData.iceParameters,
-        iceCandidates: transportData.iceCandidates,
-        // dtlsParameters: transportData.dtlsParameters, // If provided by the server
+      await deviceRef.current.load({
+        routerRtpCapabilities: transportData.routerRtpCapabilities,
       });
 
-      // Handle the transport 'connect' event by signaling the server.
-      producerTransportRef.current.on(
+      // 3. Establish the consumer (receive) transport first.
+      consumerTransportRef.current = deviceRef.current.createRecvTransport({
+        iceParameters: transportData.consumerIceParameters,
+        iceCandidates: transportData.consumerIceCandidates,
+        dtlsParameters: transportData.consumerDtlsParameters,
+      });
+      consumerTransportRef.current.on(
         "connect",
         async ({ dtlsParameters }, callback, errback) => {
-          // For this demo, we simply signal the server.
-          socket.emit("transport-connect", { dtlsParameters });
-          // In a production implementation, you’d listen for a confirmation event.
-          callback();
+          socket.emit("consumer-transport-connect", { dtlsParameters }, () => {
+            callback();
+          });
         }
       );
 
-      // Start producing by sending the video track.
+      // Process any pending peer IDs that were queued.
+      if (pendingPeers.length > 0) {
+        pendingPeers.forEach((peerId) => {
+          consumePeer(peerId);
+        });
+        setPendingPeers([]);
+      }
+
+      // 4. Establish the producer (send) transport.
+      producerTransportRef.current = deviceRef.current.createSendTransport({
+        iceParameters: transportData.producerIceParameters,
+        iceCandidates: transportData.producerIceCandidates,
+        dtlsParameters: transportData.producerDtlsParameters,
+      });
+      producerTransportRef.current.on(
+        "connect",
+        async ({ dtlsParameters }, callback, errback) => {
+          socket.emit("transport-connect", { dtlsParameters }, () => {
+            callback();
+          });
+        }
+      );
+      producerTransportRef.current.on(
+        "produce",
+        async ({ kind, rtpParameters, appData }, callback, errback) => {
+          socket.emit(
+            "transport-produce",
+            { kind, rtpParameters, appData },
+            (producerId) => {
+              callback({ id: producerId });
+            }
+          );
+        }
+      );
+
+      // 5. Start producing the local video track.
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
         const producer = await producerTransportRef.current.produce({
@@ -116,8 +157,37 @@ const VideoChat = () => {
         console.error("No video track available to produce.");
       }
     } catch (error) {
-      console.error("Error during transport setup:", error);
+      console.error("Error setting up transports:", error);
     }
+  };
+
+  // Consume a peer's video stream.
+  const consumePeer = (producerPeerId) => {
+    if (!consumerTransportRef.current) {
+      console.error("Consumer transport not established yet.");
+      return;
+    }
+    // Request consumer parameters from the server.
+    socket.emit(
+      "consume",
+      { roomId, producerPeerId, consumerId: peerIdRef.current },
+      async (consumerParams) => {
+        try {
+          const consumer = await consumerTransportRef.current.consume({
+            id: consumerParams.id,
+            producerId: consumerParams.producerId,
+            kind: consumerParams.kind,
+            rtpParameters: consumerParams.rtpParameters,
+          });
+          // Create a MediaStream and add the consumer's track.
+          const stream = new MediaStream();
+          stream.addTrack(consumer.track);
+          setRemoteStreams((prev) => [...prev, { id: producerPeerId, stream }]);
+        } catch (error) {
+          console.error("Error consuming peer:", error);
+        }
+      }
+    );
   };
 
   return (
@@ -136,15 +206,32 @@ const VideoChat = () => {
         disabled={joined || !roomId}
         style={{ padding: "8px" }}
       >
-        Create & Join Room
+        Create &amp; Join Room
       </button>
       <div style={{ marginTop: "20px" }}>
+        <h2>Your Video</h2>
         <video
-          ref={videoRef}
+          ref={localVideoRef}
           autoPlay
           playsInline
           style={{ width: "400px", border: "1px solid #ccc" }}
         />
+      </div>
+      <h2>Remote Videos</h2>
+      <div style={{ display: "flex", flexWrap: "wrap" }}>
+        {remoteStreams.map((remote) => (
+          <video
+            key={remote.id}
+            autoPlay
+            playsInline
+            style={{ width: "300px", border: "1px solid #ccc", margin: "10px" }}
+            ref={(videoEl) => {
+              if (videoEl && remote.stream) {
+                videoEl.srcObject = remote.stream;
+              }
+            }}
+          />
+        ))}
       </div>
     </div>
   );
