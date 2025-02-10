@@ -1,0 +1,1 @@
+# This is the frontend of the group meet app v2.0
